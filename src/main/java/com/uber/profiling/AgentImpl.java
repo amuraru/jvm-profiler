@@ -30,19 +30,20 @@ import com.uber.profiling.transformers.MethodProfilerStaticProxy;
 import com.uber.profiling.util.AgentLogger;
 import com.uber.profiling.util.ClassAndMethodLongMetricBuffer;
 import com.uber.profiling.util.ClassMethodArgumentMetricBuffer;
-import com.uber.profiling.util.JsonUtils;
 import com.uber.profiling.util.SparkUtils;
 import com.uber.profiling.util.StacktraceMetricBuffer;
-
 import java.lang.instrument.Instrumentation;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 public class AgentImpl {
@@ -53,6 +54,8 @@ public class AgentImpl {
     private static final int MAX_THREAD_POOL_SIZE = 2;
 
     private boolean started = false;
+
+    private Map<String, Profiler> profilers = new ConcurrentHashMap<>();
 
     public void run(Arguments arguments, Instrumentation instrumentation, Collection<AutoCloseable> objectsToCloseOnShutdown) {
         if (arguments.isNoop()) {
@@ -80,24 +83,57 @@ public class AgentImpl {
             instrumentation.addTransformer(new JavaAgentFileTransformer(arguments.getDurationProfiling(), arguments.getArgumentProfiling()));
         }
 
-        List<Profiler> profilers = createProfilers(reporter, arguments, processUuid, appId);
+        Map<String, Profiler> profilers = createProfilers(reporter, arguments, processUuid, appId);
         
-        ProfilerGroup profilerGroup = startProfilers(profilers);
+        ProfilerGroup profilerGroup = startProfilers(profilers, arguments);
 
-        Thread shutdownHook = new Thread(new ShutdownHookRunner(profilerGroup.getPeriodicProfilers(), Arrays.asList(reporter), objectsToCloseOnShutdown));
-        Runtime.getRuntime().addShutdownHook(shutdownHook);
+        if (profilerGroup!=null) {
+            Thread shutdownHook = new Thread(
+                new ShutdownHookRunner(profilerGroup.getPeriodicProfilers(),
+                    Arrays.asList(reporter), objectsToCloseOnShutdown));
+            Runtime.getRuntime().addShutdownHook(shutdownHook);
+        }
     }
 
-    public ProfilerGroup startProfilers(Collection<Profiler> profilers) {
+    public ProfilerGroup startProfilers(Map<String, Profiler> profilers, Arguments arguments) {
         if (started) {
             logger.warn("Profilers already started, do not start it again");
-            return new ProfilerGroup(new ArrayList<>(), new ArrayList<>());
+            Profiler profiler = profilers.get(StacktraceCollectorProfiler.PROFILER_NAME);
+
+            if (profiler == null){
+                Profiler reporterProfiler = profilers.get(StacktraceReporterProfiler.PROFILER_NAME);
+                if (reporterProfiler!=null) {
+                    profiler = profilers.computeIfAbsent(StacktraceCollectorProfiler.PROFILER_NAME, k -> {
+                        StacktraceCollectorProfiler stacktraceCollectorProfiler = new StacktraceCollectorProfiler(
+                            ((StacktraceReporterProfiler) reporterProfiler).getBuffer(),
+                            AgentThreadFactory.NAME_PREFIX);
+                        stacktraceCollectorProfiler.setIntervalMillis(arguments.getSampleInterval());
+                        return stacktraceCollectorProfiler;
+                    });
+                }
+            } else if (profiler.getIntervalMillis()!=arguments.getSampleInterval()){
+                //cancel old
+                profiler.cancel();
+                logger.info("Canceled " + profiler + " due to sampleInterval param change");
+            }
+
+            if (profiler!=null){
+                if (arguments.getSampleInterval() < Arguments.MIN_INTERVAL_MILLIS) {
+                    logger.warn("Won't start:" + profiler + "Interval too short, must be at least " + Arguments.MIN_INTERVAL_MILLIS);
+                } else {
+                    ProfilerRunner worker = new ProfilerRunner(profiler);
+                    ((StacktraceCollectorProfiler)profiler).setIntervalMillis(arguments.getSampleInterval());
+                    ScheduledFuture<?> handler = scheduledExecutorService.scheduleAtFixedRate(worker, 0, profiler.getIntervalMillis(), TimeUnit.MILLISECONDS);
+                    profiler.setHandler(handler);
+                }
+            }
+            return null;
         }
 
         List<Profiler> oneTimeProfilers = new ArrayList<>();
         List<Profiler> periodicProfilers = new ArrayList<>();
 
-        for (Profiler profiler : profilers) {
+        for (Profiler profiler : profilers.values()) {
             if (profiler.getIntervalMillis() == 0) {
                 oneTimeProfilers.add(profiler);
             } else if (profiler.getIntervalMillis() > 0) {
@@ -131,96 +167,116 @@ public class AgentImpl {
         return new ProfilerGroup(oneTimeProfilers, periodicProfilers);
     }
 
-    private List<Profiler> createProfilers(Reporter reporter, Arguments arguments, String processUuid, String appId) {
+    private Map<String, Profiler> createProfilers(Reporter reporter, Arguments arguments, String processUuid, String appId) {
         String tag = arguments.getTag();
         String cluster = arguments.getCluster();
         long metricInterval = arguments.getMetricInterval();
 
-        List<Profiler> profilers = new ArrayList<>();
+        profilers.computeIfAbsent(CpuAndMemoryProfiler.PROFILER_NAME, k -> {
+            CpuAndMemoryProfiler cpuAndMemoryProfiler = new CpuAndMemoryProfiler(reporter);
+            cpuAndMemoryProfiler.setTag(tag);
+            cpuAndMemoryProfiler.setCluster(cluster);
+            cpuAndMemoryProfiler.setIntervalMillis(metricInterval);
+            cpuAndMemoryProfiler.setProcessUuid(processUuid);
+            cpuAndMemoryProfiler.setAppId(appId);
+            return cpuAndMemoryProfiler;
+        } );
 
-        CpuAndMemoryProfiler cpuAndMemoryProfiler = new CpuAndMemoryProfiler(reporter);
-        cpuAndMemoryProfiler.setTag(tag);
-        cpuAndMemoryProfiler.setCluster(cluster);
-        cpuAndMemoryProfiler.setIntervalMillis(metricInterval);
-        cpuAndMemoryProfiler.setProcessUuid(processUuid);
-        cpuAndMemoryProfiler.setAppId(appId);
+        profilers.computeIfAbsent(ProcessInfoProfiler.PROFILER_NAME, k -> {
+            ProcessInfoProfiler processInfoProfiler = new ProcessInfoProfiler(reporter);
+            processInfoProfiler.setTag(tag);
+            processInfoProfiler.setCluster(cluster);
+            processInfoProfiler.setProcessUuid(processUuid);
+            processInfoProfiler.setAppId(appId);
+            return processInfoProfiler;
+        });
 
-        profilers.add(cpuAndMemoryProfiler);
-
-        ProcessInfoProfiler processInfoProfiler = new ProcessInfoProfiler(reporter);
-        processInfoProfiler.setTag(tag);
-        processInfoProfiler.setCluster(cluster);
-        processInfoProfiler.setProcessUuid(processUuid);
-        processInfoProfiler.setAppId(appId);
-
-        profilers.add(processInfoProfiler);
 
         if (!arguments.getDurationProfiling().isEmpty()) {
-            ClassAndMethodLongMetricBuffer classAndMethodMetricBuffer = new ClassAndMethodLongMetricBuffer();
+            profilers.computeIfAbsent(MethodDurationProfiler.PROFILER_NAME, k -> {
+                ClassAndMethodLongMetricBuffer classAndMethodMetricBuffer = new ClassAndMethodLongMetricBuffer();
 
-            MethodDurationProfiler methodDurationProfiler = new MethodDurationProfiler(classAndMethodMetricBuffer, reporter);
-            methodDurationProfiler.setTag(tag);
-            methodDurationProfiler.setCluster(cluster);
-            methodDurationProfiler.setIntervalMillis(metricInterval);
-            methodDurationProfiler.setProcessUuid(processUuid);
-            methodDurationProfiler.setAppId(appId);
+                MethodDurationProfiler methodDurationProfiler = new MethodDurationProfiler(classAndMethodMetricBuffer, reporter);
+                methodDurationProfiler.setTag(tag);
+                methodDurationProfiler.setCluster(cluster);
+                methodDurationProfiler.setIntervalMillis(metricInterval);
+                methodDurationProfiler.setProcessUuid(processUuid);
+                methodDurationProfiler.setAppId(appId);
 
-            MethodDurationCollector methodDurationCollector = new MethodDurationCollector(classAndMethodMetricBuffer);
-            MethodProfilerStaticProxy.setCollector(methodDurationCollector);
-
-            profilers.add(methodDurationProfiler);
+                MethodDurationCollector methodDurationCollector = new MethodDurationCollector(classAndMethodMetricBuffer);
+                MethodProfilerStaticProxy.setCollector(methodDurationCollector);
+                return methodDurationProfiler;
+            });
         }
 
         if (!arguments.getArgumentProfiling().isEmpty()) {
-            ClassMethodArgumentMetricBuffer classAndMethodArgumentBuffer = new ClassMethodArgumentMetricBuffer();
+            profilers.computeIfAbsent(MethodArgumentCollector.PROFILER_NAME, k -> {
+                    ClassMethodArgumentMetricBuffer classAndMethodArgumentBuffer = new ClassMethodArgumentMetricBuffer();
 
-            MethodArgumentProfiler methodArgumentProfiler = new MethodArgumentProfiler(classAndMethodArgumentBuffer, reporter);
-            methodArgumentProfiler.setTag(tag);
-            methodArgumentProfiler.setCluster(cluster);
-            methodArgumentProfiler.setIntervalMillis(metricInterval);
-            methodArgumentProfiler.setProcessUuid(processUuid);
-            methodArgumentProfiler.setAppId(appId);
+                    MethodArgumentProfiler methodArgumentProfiler = new MethodArgumentProfiler(
+                        classAndMethodArgumentBuffer, reporter);
+                    methodArgumentProfiler.setTag(tag);
+                    methodArgumentProfiler.setCluster(cluster);
+                    methodArgumentProfiler.setIntervalMillis(metricInterval);
+                    methodArgumentProfiler.setProcessUuid(processUuid);
+                    methodArgumentProfiler.setAppId(appId);
 
-            MethodArgumentCollector methodArgumentCollector = new MethodArgumentCollector(classAndMethodArgumentBuffer);
-            MethodProfilerStaticProxy.setArgumentCollector(methodArgumentCollector);
+                    MethodArgumentCollector methodArgumentCollector = new MethodArgumentCollector(
+                        classAndMethodArgumentBuffer);
+                    MethodProfilerStaticProxy.setArgumentCollector(methodArgumentCollector);
+                    return methodArgumentProfiler;
+                });
 
-            profilers.add(methodArgumentProfiler);
         }
-        
-        if (arguments.getSampleInterval() > 0) {
+
+        if (metricInterval > 0) {
             StacktraceMetricBuffer stacktraceMetricBuffer = new StacktraceMetricBuffer();
+            profilers
+                .computeIfAbsent(StacktraceReporterProfiler.PROFILER_NAME, k -> {
+                    StacktraceReporterProfiler stacktraceReporterProfiler = new StacktraceReporterProfiler(
+                        stacktraceMetricBuffer, reporter);
+                    stacktraceReporterProfiler.setTag(tag);
+                    stacktraceReporterProfiler.setCluster(cluster);
+                    stacktraceReporterProfiler.setIntervalMillis(metricInterval);
+                    stacktraceReporterProfiler.setProcessUuid(processUuid);
+                    stacktraceReporterProfiler.setAppId(appId);
+                    return stacktraceReporterProfiler;
+                });
+        }
 
-            StacktraceCollectorProfiler stacktraceCollectorProfiler = new StacktraceCollectorProfiler(stacktraceMetricBuffer, AgentThreadFactory.NAME_PREFIX);
-            stacktraceCollectorProfiler.setIntervalMillis(arguments.getSampleInterval());
-                    
-            StacktraceReporterProfiler stacktraceReporterProfiler = new StacktraceReporterProfiler(stacktraceMetricBuffer, reporter);
-            stacktraceReporterProfiler.setTag(tag);
-            stacktraceReporterProfiler.setCluster(cluster);
-            stacktraceReporterProfiler.setIntervalMillis(metricInterval);
-            stacktraceReporterProfiler.setProcessUuid(processUuid);
-            stacktraceReporterProfiler.setAppId(appId);
-
-            profilers.add(stacktraceCollectorProfiler);
-            profilers.add(stacktraceReporterProfiler);
+        if (arguments.getSampleInterval() > 0) {
+            Profiler reporterProfiler = profilers.get(StacktraceReporterProfiler.PROFILER_NAME);
+            if (reporterProfiler!=null) {
+                profilers.computeIfAbsent(StacktraceCollectorProfiler.PROFILER_NAME, k -> {
+                    StacktraceCollectorProfiler stacktraceCollectorProfiler = new StacktraceCollectorProfiler(
+                        ((StacktraceReporterProfiler) reporterProfiler).getBuffer(),
+                        AgentThreadFactory.NAME_PREFIX);
+                    stacktraceCollectorProfiler.setIntervalMillis(arguments.getSampleInterval());
+                    return stacktraceCollectorProfiler;
+                });
+            }
         }
 
         if (arguments.isIoProfiling()) {
-            IOProfiler ioProfiler = new IOProfiler(reporter);
-            ioProfiler.setTag(tag);
-            ioProfiler.setCluster(cluster);
-            ioProfiler.setIntervalMillis(metricInterval);
-            ioProfiler.setProcessUuid(processUuid);
-            ioProfiler.setAppId(appId);
+            profilers.computeIfAbsent(IOProfiler.PROFILER_NAME, k -> {
+                IOProfiler ioProfiler = new IOProfiler(reporter);
+                ioProfiler.setTag(tag);
+                ioProfiler.setCluster(cluster);
+                ioProfiler.setIntervalMillis(metricInterval);
+                ioProfiler.setProcessUuid(processUuid);
+                ioProfiler.setAppId(appId);
 
-            profilers.add(ioProfiler);
+                return ioProfiler;
+            });
         }
         
         return profilers;
     }
 
+    private ScheduledExecutorService scheduledExecutorService;
     private void scheduleProfilers(Collection<Profiler> profilers) {
         int threadPoolSize = Math.min(profilers.size(), MAX_THREAD_POOL_SIZE);
-        ScheduledExecutorService scheduledExecutorService = Executors.newScheduledThreadPool(threadPoolSize, new AgentThreadFactory());
+        scheduledExecutorService = Executors.newScheduledThreadPool(threadPoolSize, new AgentThreadFactory());
 
         for (Profiler profiler : profilers) {
             if (profiler.getIntervalMillis() < Arguments.MIN_INTERVAL_MILLIS) {
@@ -228,7 +284,8 @@ public class AgentImpl {
             }
             
             ProfilerRunner worker = new ProfilerRunner(profiler);
-            scheduledExecutorService.scheduleAtFixedRate(worker, 0, profiler.getIntervalMillis(), TimeUnit.MILLISECONDS);
+            ScheduledFuture<?> handler = scheduledExecutorService.scheduleAtFixedRate(worker, 0, profiler.getIntervalMillis(), TimeUnit.MILLISECONDS);
+            profiler.setHandler(handler);
             logger.info(String.format("Scheduled profiler %s with interval %s millis", profiler, profiler.getIntervalMillis()));
         }
     }

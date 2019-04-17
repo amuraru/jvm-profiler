@@ -27,16 +27,19 @@ import java.lang.management.ThreadInfo;
 import java.lang.management.ThreadMXBean;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ScheduledFuture;
 
 /**
  * This class collects stacktraces by getting thread dump via JMX, and stores the stacktraces into the given buffer.
  */
 public class StacktraceCollectorProfiler implements Profiler {
+    public static final String PROFILER_NAME = "StacktraceCollector";
     private long intervalMillis;
     private StacktraceMetricBuffer buffer;
     private String ignoreThreadNamePrefix = "";
     private int maxStringLength = Constants.MAX_STRING_LENGTH;
     private ThreadMXBean threadMXBean = ManagementFactory.getThreadMXBean();
+    private ScheduledFuture<?> handler;
 
     public StacktraceCollectorProfiler(StacktraceMetricBuffer buffer, String ignoreThreadNamePrefix) {
         this(buffer, ignoreThreadNamePrefix, Constants.MAX_STRING_LENGTH);
@@ -46,6 +49,26 @@ public class StacktraceCollectorProfiler implements Profiler {
         this.buffer = buffer;
         this.ignoreThreadNamePrefix = ignoreThreadNamePrefix == null ? "" : ignoreThreadNamePrefix;
         this.maxStringLength = maxStringLength;
+    }
+
+    @Override
+    public ScheduledFuture<?> getHandler() {
+        return this.handler;
+    }
+
+    @Override
+    public void setHandler(ScheduledFuture<?> handler) {
+        this.handler = handler;
+    }
+
+    @Override
+    public void cancel() {
+        this.handler.cancel(false);
+    }
+
+    @Override
+    public boolean isRunning() {
+        return !this.handler.isDone();
     }
 
     public void setIntervalMillis(long intervalMillis) {
@@ -63,6 +86,9 @@ public class StacktraceCollectorProfiler implements Profiler {
 
     @Override
     public void profile() {
+        if (getIntervalMillis() <=0){
+            return;
+        }
         ThreadInfo[] threadInfos = threadMXBean.dumpAllThreads(false, false);
         if (threadInfos == null) {
             return;

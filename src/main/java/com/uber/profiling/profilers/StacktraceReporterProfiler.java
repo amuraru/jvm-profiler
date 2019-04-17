@@ -41,6 +41,10 @@ public class StacktraceReporterProfiler extends ProcessInfoBase implements Profi
 
     private long intervalMillis = Constants.DEFAULT_METRIC_INTERVAL;
 
+    public StacktraceMetricBuffer getBuffer() {
+        return buffer;
+    }
+
     public StacktraceReporterProfiler(StacktraceMetricBuffer buffer, Reporter reporter) {
         this.buffer = buffer;
         this.reporter = reporter;

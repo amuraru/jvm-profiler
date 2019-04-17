@@ -16,10 +16,27 @@
 
 package com.uber.profiling;
 
+import java.util.concurrent.ScheduledFuture;
+
 public interface Profiler {
-    long getIntervalMillis();
 
-    void setReporter(Reporter reporter);
+  long getIntervalMillis();
 
-    void profile();
+  void setReporter(Reporter reporter);
+
+  void profile();
+
+  default ScheduledFuture<?> getHandler() {
+    return null;
+  }
+
+  default void setHandler(ScheduledFuture<?> handler) {
+  }
+
+  default void cancel() {
+  }
+
+  default boolean isRunning() {
+    return true;
+  }
 }
